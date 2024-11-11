@@ -30,28 +30,29 @@ against by using the '--rev' option.
 """
 # This code is derived from appcfg.py in the App Engine SDK (open source),
 # and from ASPN recipe #146306.
-
-import ConfigParser
-import cookielib
+import mimetypes
+import sys
+import os
+import subprocess
+import logging
+import sys
+import argparse
 import fnmatch
 import getpass
 import logging
 import mimetypes
-import optparse
 import os
 import re
 import socket
 import subprocess
 import sys
 import urllib
-import urllib2
-import urlparse
+from hashlib import md5
+from http.cookiejar import MozillaCookieJar, CookieJar
+from urllib.parse import urlparse
 
-# The md5 module was deprecated in Python 2.5.
-try:
-  from hashlib import md5
-except ImportError:
-  from md5 import md5
+import urllib3
+from urllib3 import PoolManager, exceptions
 
 try:
   import readline
@@ -79,6 +80,8 @@ VCS_UNKNOWN = "Unknown"
 TEXT_MIMETYPES = ['application/javascript', 'application/x-javascript',
                   'application/x-freemind']
 
+# TEXT_MIMETYPES = {"application/xml", "application/json"}
+
 VCS_ABBREVIATIONS = {
   VCS_MERCURIAL.lower(): VCS_MERCURIAL,
   "hg": VCS_MERCURIAL,
@@ -90,687 +93,678 @@ VCS_ABBREVIATIONS = {
 # The result of parsing Subversion's [auto-props] setting.
 svn_auto_props_map = None
 
-def GetEmail(prompt):
-  """Prompts the user for their email address and returns it.
+def get_email(prompt):
+    """Prompts the user for their email address and returns it.
 
-  The last used email address is saved to a file and offered up as a suggestion
-  to the user. If the user presses enter without typing in anything the last
-  used email address is used. If the user enters a new address, it is saved
-  for next time we prompt.
+    The last used email address is saved to a file and offered up as a suggestion
+    to the user. If the user presses enter without typing in anything the last
+    used email address is used. If the user enters a new address, it is saved
+    for next time we prompt.
 
-  """
-  last_email_file_name = os.path.expanduser("~/.last_codereview_email_address")
-  last_email = ""
-  if os.path.exists(last_email_file_name):
-    try:
-      last_email_file = open(last_email_file_name, "r")
-      last_email = last_email_file.readline().strip("\n")
-      last_email_file.close()
-      prompt += " [%s]" % last_email
-    except IOError, e:
-      pass
-  email = raw_input(prompt + ": ").strip()
-  if email:
-    try:
-      last_email_file = open(last_email_file_name, "w")
-      last_email_file.write(email)
-      last_email_file.close()
-    except IOError, e:
-      pass
-  else:
-    email = last_email
-  return email
+    """
+    last_email_file_name = os.path.expanduser("~/.last_codereview_email_address")
+    last_email = ""
+    if os.path.exists(last_email_file_name):
+        try:
+            with open(last_email_file_name, "r") as last_email_file:
+                last_email = last_email_file.readline().strip("\n")
+            prompt += f" [{last_email}]"
+        except IOError:
+            pass
 
-
-def StatusUpdate(msg):
-  """Print a status message to stdout.
-
-  If 'verbosity' is greater than 0, print the message.
-
-  Args:
-    msg: The string to print.
-  """
-  if verbosity > 0:
-    print msg
+    # Use input() in Python 3
+    email = input(prompt + ": ").strip()
+    if email:
+        try:
+            with open(last_email_file_name, "w") as last_email_file:
+                last_email_file.write(email)
+        except IOError:
+            pass
+    else:
+        email = last_email
+    return email
 
 
-def ErrorExit(msg):
-  """Print an error message to stderr and exit."""
-  print >>sys.stderr, msg
-  sys.exit(1)
+
+def status_update(msg):
+    """Print a status message to stdout.
+
+    If 'verbosity' is greater than 0, print the message.
+
+    Args:
+        msg: The string to print.
+    """
+    if verbosity > 0:
+        print(msg)
 
 
-class ClientLoginError(urllib2.HTTPError):
-  """Raised to indicate there was an error authenticating with ClientLogin."""
+def error_exit(msg):
+    """Print an error message to stderr and exit.
 
-  def __init__(self, url, code, msg, headers, args):
-    urllib2.HTTPError.__init__(self, url, code, msg, headers, None)
-    self.args = args
-    self.reason = args["Error"]
+    Args:
+        msg: The error message to print.
+    """
+    print(msg, file=sys.stderr)
+    sys.exit(1)
 
+
+class ClientLoginError(exceptions.HTTPError):
+    """Raised to indicate there was an error authenticating with ClientLogin."""
+
+    def __init__(self, url, code, msg, headers, args):
+        super().__init__(f"HTTP Error {code}: {msg}")
+        self.url = url
+        self.code = code
+        self.msg = msg
+        self.headers = headers
+        self.args = args
+        self.reason = args["Error"]
 
 class AbstractRpcServer(object):
-  """Provides a common interface for a simple RPC server."""
+    """Provides a common interface for a simple RPC server."""
 
-  def __init__(self, host, auth_function, host_override=None, extra_headers={},
-               save_cookies=False):
-    """Creates a new HttpRpcServer.
+    def __init__(self, host, auth_function, host_override=None, extra_headers=None,
+                 save_cookies=False):
+        """Creates a new HttpRpcServer.
 
-    Args:
-      host: The host to send requests to.
-      auth_function: A function that takes no arguments and returns an
-        (email, password) tuple when called. Will be called if authentication
-        is required.
-      host_override: The host header to send to the server (defaults to host).
-      extra_headers: A dict of extra headers to append to every request.
-      save_cookies: If True, save the authentication cookies to local disk.
-        If False, use an in-memory cookiejar instead.  Subclasses must
-        implement this functionality.  Defaults to False.
-    """
-    self.host = host
-    self.host_override = host_override
-    self.auth_function = auth_function
-    self.authenticated = False
-    self.extra_headers = extra_headers
-    self.save_cookies = save_cookies
-    self.opener = self._GetOpener()
-    if self.host_override:
-      logging.info("Server: %s; Host: %s", self.host, self.host_override)
-    else:
-      logging.info("Server: %s", self.host)
+        Args:
+            host: The host to send requests to.
+            auth_function: A function that takes no arguments and returns an
+                (email, password) tuple when called. Will be called if authentication
+                is required.
+            host_override: The host header to send to the server (defaults to host).
+            extra_headers: A dict of extra headers to append to every request.
+            save_cookies: If True, save the authentication cookies to local disk.
+                If False, use an in-memory cookiejar instead. Defaults to False.
+        """
+        self.host = host
+        self.host_override = host_override
+        self.auth_function = auth_function
+        self.authenticated = False
+        self.extra_headers = extra_headers if extra_headers is not None else {}
+        self.save_cookies = save_cookies
+        self.http = PoolManager()
+        if self.host_override:
+            logging.info("Server: %s; Host: %s", self.host, self.host_override)
+        else:
+            logging.info("Server: %s", self.host)
 
-  def _GetOpener(self):
-    """Returns an OpenerDirector for making HTTP requests.
+    def _GetOpener(self):
+        """Returns an OpenerDirector for making HTTP requests.
 
-    Returns:
-      A urllib2.OpenerDirector object.
-    """
-    raise NotImplementedError()
+        Returns:
+          An object for making HTTP requests.
+        """
+        raise NotImplementedError()
 
-  def _CreateRequest(self, url, data=None):
-    """Creates a new urllib request."""
-    logging.debug("Creating request for: '%s' with payload:\n%s", url, data)
-    req = urllib2.Request(url, data=data)
-    if self.host_override:
-      req.add_header("Host", self.host_override)
-    for key, value in self.extra_headers.iteritems():
-      req.add_header(key, value)
-    return req
+    def _CreateRequest(self, url, data=None):
+        """Creates a new HTTP request.
 
-  def _GetAuthToken(self, email, password):
-    """Uses ClientLogin to authenticate the user, returning an auth token.
+        Args:
+            url: The URL for the request.
+            data: Optional data payload for the request.
 
-    Args:
-      email:    The user's email address
-      password: The user's password
+        Returns:
+            A request object with added headers.
+        """
+        logging.debug("Creating request for: '%s' with payload:\n%s", url, data)
+        headers = {"Host": self.host_override} if self.host_override else {}
+        headers.update(self.extra_headers)
+        req = urllib3.request.RequestMethods().request_encode_body('POST' if data else 'GET', url, body=data,
+                                                                   headers=headers)
+        return req
 
-    Raises:
-      ClientLoginError: If there was an error authenticating with ClientLogin.
-      HTTPError: If there was some other form of HTTP error.
+    def _GetAuthToken(self, email, password):
+        """Uses ClientLogin to authenticate the user, returning an auth token.
 
-    Returns:
-      The authentication token returned by ClientLogin.
-    """
-    account_type = "GOOGLE"
-    if self.host.endswith(".google.com"):
-      # Needed for use inside Google.
-      account_type = "HOSTED"
-    req = self._CreateRequest(
-        url="https://www.google.com/accounts/ClientLogin",
-        data=urllib.urlencode({
-            "Email": email,
-            "Passwd": password,
-            "service": "ah",
-            "source": "rietveld-codereview-upload",
-            "accountType": account_type,
-        }),
-    )
-    try:
-      response = self.opener.open(req)
-      response_body = response.read()
-      response_dict = dict(x.split("=")
-                           for x in response_body.split("\n") if x)
-      return response_dict["Auth"]
-    except urllib2.HTTPError, e:
-      if e.code == 403:
-        body = e.read()
-        response_dict = dict(x.split("=", 1) for x in body.split("\n") if x)
-        raise ClientLoginError(req.get_full_url(), e.code, e.msg,
-                               e.headers, response_dict)
-      else:
-        raise
+        Args:
+            email: The user's email address.
+            password: The user's password.
 
-  def _GetAuthCookie(self, auth_token):
-    """Fetches authentication cookies for an authentication token.
+        Raises:
+            ClientLoginError: If there was an error authenticating with ClientLogin.
+            HTTPError: If there was some other form of HTTP error.
 
-    Args:
-      auth_token: The authentication token returned by ClientLogin.
-
-    Raises:
-      HTTPError: If there was an error fetching the authentication cookies.
-    """
-    # This is a dummy value to allow us to identify when we're successful.
-    continue_location = "http://localhost/"
-    args = {"continue": continue_location, "auth": auth_token}
-    req = self._CreateRequest("http://%s/_ah/login?%s" %
-                              (self.host, urllib.urlencode(args)))
-    try:
-      response = self.opener.open(req)
-    except urllib2.HTTPError, e:
-      response = e
-    if (response.code != 302 or
-        response.info()["location"] != continue_location):
-      raise urllib2.HTTPError(req.get_full_url(), response.code, response.msg,
-                              response.headers, response.fp)
-    self.authenticated = True
-
-  def _Authenticate(self):
-    """Authenticates the user.
-
-    The authentication process works as follows:
-     1) We get a username and password from the user
-     2) We use ClientLogin to obtain an AUTH token for the user
-        (see http://code.google.com/apis/accounts/AuthForInstalledApps.html).
-     3) We pass the auth token to /_ah/login on the server to obtain an
-        authentication cookie. If login was successful, it tries to redirect
-        us to the URL we provided.
-
-    If we attempt to access the upload API without first obtaining an
-    authentication cookie, it returns a 401 response (or a 302) and
-    directs us to authenticate ourselves with ClientLogin.
-    """
-    for i in range(3):
-      credentials = self.auth_function()
-      try:
-        auth_token = self._GetAuthToken(credentials[0], credentials[1])
-      except ClientLoginError, e:
-        if e.reason == "BadAuthentication":
-          print >>sys.stderr, "Invalid username or password."
-          continue
-        if e.reason == "CaptchaRequired":
-          print >>sys.stderr, (
-              "Please go to\n"
-              "https://www.google.com/accounts/DisplayUnlockCaptcha\n"
-              "and verify you are a human.  Then try again.")
-          break
-        if e.reason == "NotVerified":
-          print >>sys.stderr, "Account not verified."
-          break
-        if e.reason == "TermsNotAgreed":
-          print >>sys.stderr, "User has not agreed to TOS."
-          break
-        if e.reason == "AccountDeleted":
-          print >>sys.stderr, "The user account has been deleted."
-          break
-        if e.reason == "AccountDisabled":
-          print >>sys.stderr, "The user account has been disabled."
-          break
-        if e.reason == "ServiceDisabled":
-          print >>sys.stderr, ("The user's access to the service has been "
-                               "disabled.")
-          break
-        if e.reason == "ServiceUnavailable":
-          print >>sys.stderr, "The service is not available; try again later."
-          break
-        raise
-      self._GetAuthCookie(auth_token)
-      return
-
-  def Send(self, request_path, payload=None,
-           content_type="application/octet-stream",
-           timeout=None,
-           **kwargs):
-    """Sends an RPC and returns the response.
-
-    Args:
-      request_path: The path to send the request to, eg /api/appversion/create.
-      payload: The body of the request, or None to send an empty request.
-      content_type: The Content-Type header to use.
-      timeout: timeout in seconds; default None i.e. no timeout.
-        (Note: for large requests on OS X, the timeout doesn't work right.)
-      kwargs: Any keyword arguments are converted into query string parameters.
-
-    Returns:
-      The response body, as a string.
-    """
-    # TODO: Don't require authentication.  Let the server say
-    # whether it is necessary.
-    if not self.authenticated:
-      self._Authenticate()
-
-    old_timeout = socket.getdefaulttimeout()
-    socket.setdefaulttimeout(timeout)
-    try:
-      tries = 0
-      while True:
-        tries += 1
-        args = dict(kwargs)
-        url = "http://%s%s" % (self.host, request_path)
-        if args:
-          url += "?" + urllib.urlencode(args)
-        req = self._CreateRequest(url=url, data=payload)
-        req.add_header("Content-Type", content_type)
+        Returns:
+            The authentication token returned by ClientLogin.
+        """
+        account_type = "GOOGLE"
+        if self.host.endswith(".google.com"):
+            account_type = "HOSTED"
+        req = self._CreateRequest(
+            url="https://www.google.com/accounts/ClientLogin",
+            data=urllib3.request.urlencode({
+                "Email": email,
+                "Passwd": password,
+                "service": "ah",
+                "source": "rietveld-codereview-upload",
+                "accountType": account_type,
+            }).encode('utf-8'),
+        )
         try:
-          f = self.opener.open(req)
-          response = f.read()
-          f.close()
-          return response
-        except urllib2.HTTPError, e:
-          if tries > 3:
-            raise
-          elif e.code == 401 or e.code == 302:
+            response = self.http.urlopen('POST', req.get_full_url(), body=req.data, headers=req.headers)
+            response_body = response.data.decode('utf-8')
+            response_dict = dict(x.split("=") for x in response_body.split("\n") if x)
+            return response_dict["Auth"]
+        except urllib3.exceptions.HTTPError as e:
+            if e.status == 403:
+                body = e.data.decode('utf-8')
+                response_dict = dict(x.split("=", 1) for x in body.split("\n") if x)
+                raise ClientLoginError(req.get_full_url(), e.status, e.reason, e.headers, response_dict)
+            else:
+                raise
+
+    def _GetAuthCookie(self, auth_token):
+        """Fetches authentication cookies for an authentication token.
+
+        Args:
+            auth_token: The authentication token returned by ClientLogin.
+
+        Raises:
+            HTTPError: If there was an error fetching the authentication cookies.
+        """
+        continue_location = "http://localhost/"
+        args = {"continue": continue_location, "auth": auth_token}
+        req = self._CreateRequest(f"http://{self.host}/_ah/login?{urllib3.request.urlencode(args)}")
+        try:
+            response = self.http.urlopen('GET', req.get_full_url(), headers=req.headers)
+        except urllib3.exceptions.HTTPError as e:
+            response = e
+        if response.status != 302 or response.getheader("location") != continue_location:
+            raise urllib3.exceptions.HTTPError(req.get_full_url(), response.status, response.reason, response.headers, response.data)
+        self.authenticated = True
+
+    def _Authenticate(self):
+        """Authenticates the user.
+
+        The authentication process works as follows:
+         1) We get a username and password from the user
+         2) We use ClientLogin to obtain an AUTH token for the user
+            (see http://code.google.com/apis/accounts/AuthForInstalledApps.html).
+         3) We pass the auth token to /_ah/login on the server to obtain an
+            authentication cookie. If login was successful, it tries to redirect
+            us to the URL we provided.
+
+        If we attempt to access the upload API without first obtaining an
+        authentication cookie, it returns a 401 response (or a 302) and
+        directs us to authenticate ourselves with ClientLogin.
+        """
+        for i in range(3):
+            credentials = self.auth_function()
+            try:
+                auth_token = self._GetAuthToken(credentials[0], credentials[1])
+            except ClientLoginError as e:
+                if e.reason == "BadAuthentication":
+                    print("Invalid username or password.", file=sys.stderr)
+                    continue
+                if e.reason == "CaptchaRequired":
+                    print(
+                        "Please go to\n"
+                        "https://www.google.com/accounts/DisplayUnlockCaptcha\n"
+                        "and verify you are a human.  Then try again.",
+                        file=sys.stderr
+                    )
+                    break
+                if e.reason == "NotVerified":
+                    print("Account not verified.", file=sys.stderr)
+                    break
+                if e.reason == "TermsNotAgreed":
+                    print("User has not agreed to TOS.", file=sys.stderr)
+                    break
+                if e.reason == "AccountDeleted":
+                    print("The user account has been deleted.", file=sys.stderr)
+                    break
+                if e.reason == "AccountDisabled":
+                    print("The user account has been disabled.", file=sys.stderr)
+                    break
+                if e.reason == "ServiceDisabled":
+                    print("The user's access to the service has been disabled.", file=sys.stderr)
+                    break
+                if e.reason == "ServiceUnavailable":
+                    print("The service is not available; try again later.", file=sys.stderr)
+                    break
+                raise
+            self._GetAuthCookie(auth_token)
+            return
+
+    def Send(self, request_path, payload=None,
+             content_type="application/octet-stream",
+             timeout=None,
+             **kwargs):
+        """Sends an RPC and returns the response.
+
+        Args:
+            request_path: The path to send the request to, eg /api/appversion/create.
+            payload: The body of the request, or None to send an empty request.
+            content_type: The Content-Type header to use.
+            timeout: timeout in seconds; default None i.e. no timeout.
+                (Note: for large requests on OS X, the timeout doesn't work right.)
+            kwargs: Any keyword arguments are converted into query string parameters.
+
+        Returns:
+            The response body, as a string.
+        """
+        if not self.authenticated:
             self._Authenticate()
-##           elif e.code >= 500 and e.code < 600:
-##             # Server Error - try again.
-##             continue
-          else:
-            raise
-    finally:
-      socket.setdefaulttimeout(old_timeout)
+
+        old_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(timeout)
+        try:
+            tries = 0
+            while True:
+                tries += 1
+                args = dict(kwargs)
+                url = f"http://{self.host}{request_path}"
+                if args:
+                    url += "?" + urllib3.request.urlencode(args)
+                req = self._CreateRequest(url=url, data=payload)
+                req.add_header("Content-Type", content_type)
+                try:
+                    response = self.http.urlopen('POST' if payload else 'GET', url, body=payload, headers=req.headers)
+                    return response.data.decode('utf-8')
+                except urllib3.exceptions.HTTPError as e:
+                    if tries > 3 or e.status not in (401, 302):
+                        raise
+                    self._Authenticate()
+        finally:
+            socket.setdefaulttimeout(old_timeout)
 
 
 class HttpRpcServer(AbstractRpcServer):
-  """Provides a simplified RPC-style interface for HTTP requests."""
+    """Provides a simplified RPC-style interface for HTTP requests."""
 
-  def _Authenticate(self):
-    """Save the cookie jar after authentication."""
-    super(HttpRpcServer, self)._Authenticate()
-    if self.save_cookies:
-      StatusUpdate("Saving authentication cookies to %s" % self.cookie_file)
-      self.cookie_jar.save()
+    def _Authenticate(self):
+        """Save the cookie jar after authentication."""
+        super(HttpRpcServer, self)._Authenticate()
+        if self.save_cookies:
+            status_update("Saving authentication cookies to %s" % self.cookie_file)
+            self.cookie_jar.save()
 
-  def _GetOpener(self):
-    """Returns an OpenerDirector that supports cookies and ignores redirects.
+    def _GetOpener(self):
+        """Sets up an HTTP opener that supports cookies.
+
+        Returns:
+            A urllib3 PoolManager object.
+        """
+        self.http = urllib3.PoolManager()
+        if self.save_cookies:
+            self.cookie_file = os.path.expanduser("~/.codereview_upload_cookies")
+            self.cookie_jar = MozillaCookieJar(self.cookie_file)
+            if os.path.exists(self.cookie_file):
+                try:
+                    self.cookie_jar.load()
+                    self.authenticated = True
+                    status_update("Loaded authentication cookies from %s" % self.cookie_file)
+                except (Exception, IOError):
+                    pass
+            else:
+                fd = os.open(self.cookie_file, os.O_CREAT, 0o600)
+                os.close(fd)
+            os.chmod(self.cookie_file, 0o600)
+        else:
+            self.cookie_jar = CookieJar()
+
+        return self.http
+
+
+parser = argparse.ArgumentParser(
+    description="Process command-line arguments for gdata-python-client.",
+    usage="%(prog)s [options] [-- diff_options]"
+)
+
+parser.add_argument("-y", "--assume_yes", action="store_true",
+                    help="Assume that the answer to yes/no questions is 'yes'.")
+
+# Logging
+logging_group = parser.add_argument_group("Logging options")
+logging_group.add_argument("-q", "--quiet", action="store_const", const=0,
+                           dest="verbose", help="Print errors only.")
+logging_group.add_argument("-v", "--verbose", action="store_const", const=2,
+                           dest="verbose", default=1,
+                           help="Print info level logs (default).")
+logging_group.add_argument("--noisy", action="store_const", const=3,
+                           dest="verbose", help="Print all logs.")
+
+# Review server
+server_group = parser.add_argument_group("Review server options")
+server_group.add_argument("-s", "--server", dest="server",
+                          default="codereview.appspot.com",
+                          metavar="SERVER",
+                          help=("The server to upload to. The format is host[:port]. "
+                                "Defaults to '%(default)s'."))
+server_group.add_argument("-e", "--email", dest="email",
+                          metavar="EMAIL", default=None,
+                          help="The username to use. Will prompt if omitted.")
+server_group.add_argument("-H", "--host", dest="host",
+                          metavar="HOST", default=None,
+                          help="Overrides the Host header sent with all RPCs.")
+server_group.add_argument("--no_cookies", action="store_false",
+                          dest="save_cookies", default=True,
+                          help="Do not save authentication cookies to local disk.")
+
+# Issue options
+issue_group = parser.add_argument_group("Issue options")
+issue_group.add_argument("-d", "--description", dest="description",
+                         metavar="DESCRIPTION", default=None,
+                         help="Optional description when creating an issue.")
+issue_group.add_argument("-f", "--description_file", dest="description_file",
+                         metavar="DESCRIPTION_FILE", default=None,
+                         help="Optional path of a file that contains "
+                              "the description when creating an issue.")
+issue_group.add_argument("-r", "--reviewers", dest="reviewers",
+                         metavar="REVIEWERS", default=",afshar@google.com",
+                         help="Add reviewers (comma separated email addresses).")
+issue_group.add_argument("--cc", dest="cc",
+                         metavar="CC", default="gdata-python-client-library-contributors@googlegroups.com",
+                         help="Add CC (comma separated email addresses).")
+issue_group.add_argument("--private", action="store_true", dest="private",
+                         default=False,
+                         help="Make the issue restricted to reviewers and those CCed.")
+
+# Upload options
+upload_group = parser.add_argument_group("Patch options")
+upload_group.add_argument("-m", "--message", dest="message",
+                          metavar="MESSAGE", default=None,
+                          help="A message to identify the patch. "
+                               "Will prompt if omitted.")
+upload_group.add_argument("-i", "--issue", type=int, dest="issue",
+                          metavar="ISSUE", default=None,
+                          help="Issue number to which to add. Defaults to new issue.")
+upload_group.add_argument("--base_url", dest="base_url", default=None,
+                          help="Base repository URL (listed as \"Base URL\" when "
+                               "viewing issue). If omitted, will be guessed automatically "
+                               "for SVN repos and left blank for others.")
+upload_group.add_argument("--download_base", action="store_true",
+                          dest="download_base", default=False,
+                          help="Base files will be downloaded by the server "
+                               "(side-by-side diffs may not work on files with CRs).")
+upload_group.add_argument("--rev", dest="revision",
+                          metavar="REV", default=None,
+                          help="Base revision/branch/tree to diff against. Use "
+                               "rev1:rev2 range to review already committed changeset.")
+upload_group.add_argument("--send_mail", action="store_true",
+                          dest="send_mail", default=True,
+                          help="Send notification email to reviewers.")
+upload_group.add_argument("--vcs", dest="vcs",
+                          metavar="VCS", default=None,
+                          help=("Version control system (optional, usually upload.py "
+                                "already guesses the right VCS)."))
+upload_group.add_argument("--emulate_svn_auto_props", action="store_true",
+                          dest="emulate_svn_auto_props", default=False,
+                          help="Emulate Subversion's auto properties feature.")
+
+args = parser.parse_args()
+
+import getpass
+import logging
+
+def get_rpc_server(options):
+    """Returns an instance of an AbstractRpcServer.
 
     Returns:
-      A urllib2.OpenerDirector object.
+        A new AbstractRpcServer, on which RPC calls can be made.
     """
-    opener = urllib2.OpenerDirector()
-    opener.add_handler(urllib2.ProxyHandler())
-    opener.add_handler(urllib2.UnknownHandler())
-    opener.add_handler(urllib2.HTTPHandler())
-    opener.add_handler(urllib2.HTTPDefaultErrorHandler())
-    opener.add_handler(urllib2.HTTPSHandler())
-    opener.add_handler(urllib2.HTTPErrorProcessor())
-    if self.save_cookies:
-      self.cookie_file = os.path.expanduser("~/.codereview_upload_cookies")
-      self.cookie_jar = cookielib.MozillaCookieJar(self.cookie_file)
-      if os.path.exists(self.cookie_file):
-        try:
-          self.cookie_jar.load()
-          self.authenticated = True
-          StatusUpdate("Loaded authentication cookies from %s" %
-                       self.cookie_file)
-        except (cookielib.LoadError, IOError):
-          # Failed to load cookies - just ignore them.
-          pass
-      else:
-        # Create an empty cookie file with mode 600
-        fd = os.open(self.cookie_file, os.O_CREAT, 0600)
-        os.close(fd)
-      # Always chmod the cookie file
-      os.chmod(self.cookie_file, 0600)
-    else:
-      # Don't save cookies across runs of update.py.
-      self.cookie_jar = cookielib.CookieJar()
-    opener.add_handler(urllib2.HTTPCookieProcessor(self.cookie_jar))
-    return opener
 
+    rpc_server_class = HttpRpcServer
 
-parser = optparse.OptionParser(usage="%prog [options] [-- diff_options]")
-parser.add_option("-y", "--assume_yes", action="store_true",
-                  dest="assume_yes", default=False,
-                  help="Assume that the answer to yes/no questions is 'yes'.")
-# Logging
-group = parser.add_option_group("Logging options")
-group.add_option("-q", "--quiet", action="store_const", const=0,
-                 dest="verbose", help="Print errors only.")
-group.add_option("-v", "--verbose", action="store_const", const=2,
-                 dest="verbose", default=1,
-                 help="Print info level logs (default).")
-group.add_option("--noisy", action="store_const", const=3,
-                 dest="verbose", help="Print all logs.")
-# Review server
-group = parser.add_option_group("Review server options")
-group.add_option("-s", "--server", action="store", dest="server",
-                 default="codereview.appspot.com",
-                 metavar="SERVER",
-                 help=("The server to upload to. The format is host[:port]. "
-                       "Defaults to '%default'."))
-group.add_option("-e", "--email", action="store", dest="email",
-                 metavar="EMAIL", default=None,
-                 help="The username to use. Will prompt if omitted.")
-group.add_option("-H", "--host", action="store", dest="host",
-                 metavar="HOST", default=None,
-                 help="Overrides the Host header sent with all RPCs.")
-group.add_option("--no_cookies", action="store_false",
-                 dest="save_cookies", default=True,
-                 help="Do not save authentication cookies to local disk.")
-# Issue
-group = parser.add_option_group("Issue options")
-group.add_option("-d", "--description", action="store", dest="description",
-                 metavar="DESCRIPTION", default=None,
-                 help="Optional description when creating an issue.")
-group.add_option("-f", "--description_file", action="store",
-                 dest="description_file", metavar="DESCRIPTION_FILE",
-                 default=None,
-                 help="Optional path of a file that contains "
-                      "the description when creating an issue.")
-group.add_option("-r", "--reviewers", action="store", dest="reviewers",
-                 metavar="REVIEWERS", default=",afshar@google.com",
-                 help="Add reviewers (comma separated email addresses).")
-group.add_option("--cc", action="store", dest="cc",
-                 metavar="CC", default="gdata-python-client-library-contributors@googlegroups.com",
-                 help="Add CC (comma separated email addresses).")
-group.add_option("--private", action="store_true", dest="private",
-                 default=False,
-                 help="Make the issue restricted to reviewers and those CCed")
-# Upload options
-group = parser.add_option_group("Patch options")
-group.add_option("-m", "--message", action="store", dest="message",
-                 metavar="MESSAGE", default=None,
-                 help="A message to identify the patch. "
-                      "Will prompt if omitted.")
-group.add_option("-i", "--issue", type="int", action="store",
-                 metavar="ISSUE", default=None,
-                 help="Issue number to which to add. Defaults to new issue.")
-group.add_option("--base_url", action="store", dest="base_url", default=None,
-                 help="Base repository URL (listed as \"Base URL\" when "
-                 "viewing issue).  If omitted, will be guessed automatically "
-                 "for SVN repos and left blank for others.")
-group.add_option("--download_base", action="store_true",
-                 dest="download_base", default=False,
-                 help="Base files will be downloaded by the server "
-                 "(side-by-side diffs may not work on files with CRs).")
-group.add_option("--rev", action="store", dest="revision",
-                 metavar="REV", default=None,
-                 help="Base revision/branch/tree to diff against. Use "
-                      "rev1:rev2 range to review already committed changeset.")
-group.add_option("--send_mail", action="store_true",
-                 dest="send_mail", default=True,
-                 help="Send notification email to reviewers.")
-group.add_option("--vcs", action="store", dest="vcs",
-                 metavar="VCS", default=None,
-                 help=("Version control system (optional, usually upload.py "
-                       "already guesses the right VCS)."))
-group.add_option("--emulate_svn_auto_props", action="store_true",
-                 dest="emulate_svn_auto_props", default=False,
-                 help=("Emulate Subversion's auto properties feature."))
+    def get_user_credentials():
+        """Prompts the user for a username and password."""
+        email = options.email
+        if email is None:
+            email = get_email(f"Email (login for uploading to {options.server})")
+        password = getpass.getpass(f"Password for {email}: ")
+        return (email, password)
 
+    # If this is the dev_appserver, use fake authentication.
+    host = (options.host or options.server).lower()
+    if host == "localhost" or host.startswith("localhost:"):
+        email = options.email
+        if email is None:
+            email = "test@example.com"
+            logging.info("Using debug user %s. Override with --email", email)
+        server = rpc_server_class(
+            options.server,
+            lambda: (email, "password"),
+            host_override=options.host,
+            extra_headers={"Cookie": f'dev_appserver_login="{email}:False"'},
+            save_cookies=options.save_cookies
+        )
+        # Skip ClientLogin for localhost testing
+        server.authenticated = True
+        return server
 
-def GetRpcServer(options):
-  """Returns an instance of an AbstractRpcServer.
-
-  Returns:
-    A new AbstractRpcServer, on which RPC calls can be made.
-  """
-
-  rpc_server_class = HttpRpcServer
-
-  def GetUserCredentials():
-    """Prompts the user for a username and password."""
-    email = options.email
-    if email is None:
-      email = GetEmail("Email (login for uploading to %s)" % options.server)
-    password = getpass.getpass("Password for %s: " % email)
-    return (email, password)
-
-  # If this is the dev_appserver, use fake authentication.
-  host = (options.host or options.server).lower()
-  if host == "localhost" or host.startswith("localhost:"):
-    email = options.email
-    if email is None:
-      email = "test@example.com"
-      logging.info("Using debug user %s.  Override with --email" % email)
-    server = rpc_server_class(
+    return rpc_server_class(
         options.server,
-        lambda: (email, "password"),
+        get_user_credentials,
         host_override=options.host,
-        extra_headers={"Cookie":
-                       'dev_appserver_login="%s:False"' % email},
-        save_cookies=options.save_cookies)
-    # Don't try to talk to ClientLogin.
-    server.authenticated = True
-    return server
+        save_cookies=options.save_cookies
+    )
 
-  return rpc_server_class(options.server, GetUserCredentials,
-                          host_override=options.host,
-                          save_cookies=options.save_cookies)
+def encode_multipart_form_data(fields, files):
+    """Encode form fields for multipart/form-data.
 
+    Args:
+        fields: A sequence of (name, value) elements for regular form fields.
+        files: A sequence of (name, filename, value) elements for data to be
+               uploaded as files.
+    Returns:
+        (content_type, body) ready for urllib3 HTTP request.
+    """
+    BOUNDARY = '-M-A-G-I-C---B-O-U-N-D-A-R-Y-'
+    CRLF = '\r\n'
+    lines = []
 
-def EncodeMultipartFormData(fields, files):
-  """Encode form fields for multipart/form-data.
+    # Add fields
+    for key, value in fields:
+        lines.append(f'--{BOUNDARY}')
+        lines.append(f'Content-Disposition: form-data; name="{key}"')
+        lines.append('')
+        lines.append(value)
 
-  Args:
-    fields: A sequence of (name, value) elements for regular form fields.
-    files: A sequence of (name, filename, value) elements for data to be
-           uploaded as files.
-  Returns:
-    (content_type, body) ready for httplib.HTTP instance.
+    # Add files
+    for key, filename, value in files:
+        lines.append(f'--{BOUNDARY}')
+        lines.append(f'Content-Disposition: form-data; name="{key}"; filename="{filename}"')
+        lines.append(f'Content-Type: {get_content_type(filename)}')
+        lines.append('')
+        lines.append(value)
 
-  Source:
-    http://aspn.activestate.com/ASPN/Cookbook/Python/Recipe/146306
-  """
-  BOUNDARY = '-M-A-G-I-C---B-O-U-N-D-A-R-Y-'
-  CRLF = '\r\n'
-  lines = []
-  for (key, value) in fields:
-    lines.append('--' + BOUNDARY)
-    lines.append('Content-Disposition: form-data; name="%s"' % key)
+    # End of the boundary
+    lines.append(f'--{BOUNDARY}--')
     lines.append('')
-    lines.append(value)
-  for (key, filename, value) in files:
-    lines.append('--' + BOUNDARY)
-    lines.append('Content-Disposition: form-data; name="%s"; filename="%s"' %
-             (key, filename))
-    lines.append('Content-Type: %s' % GetContentType(filename))
-    lines.append('')
-    lines.append(value)
-  lines.append('--' + BOUNDARY + '--')
-  lines.append('')
-  body = CRLF.join(lines)
-  content_type = 'multipart/form-data; boundary=%s' % BOUNDARY
-  return content_type, body
+    body = CRLF.join(lines)
+    content_type = f'multipart/form-data; boundary={BOUNDARY}'
+    return content_type, body
 
 
-def GetContentType(filename):
-  """Helper to guess the content-type from the filename."""
-  return mimetypes.guess_type(filename)[0] or 'application/octet-stream'
+def get_content_type(filename):
+    """Helper to guess the content-type from the filename."""
+    return mimetypes.guess_type(filename)[0] or 'application/octet-stream'
 
 
 # Use a shell for subcommands on Windows to get a PATH search.
 use_shell = sys.platform.startswith("win")
 
-def RunShellWithReturnCode(command, print_output=False,
-                           universal_newlines=True,
-                           env=os.environ):
-  """Executes a command and returns the output from stdout and the return code.
+def run_shell_with_return_code(command, print_output=False,
+                               universal_newlines=True,
+                               env=os.environ):
+    """Executes a command and returns the output from stdout and the return code.
 
-  Args:
-    command: Command to execute.
-    print_output: If True, the output is printed to stdout.
-                  If False, both stdout and stderr are ignored.
-    universal_newlines: Use universal_newlines flag (default: True).
+    Args:
+        command: Command to execute.
+        print_output: If True, the output is printed to stdout.
+                      If False, both stdout and stderr are ignored.
+        universal_newlines: Use universal_newlines flag (default: True).
 
-  Returns:
-    Tuple (output, return code)
-  """
-  logging.info("Running %s", command)
-  p = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                       shell=use_shell, universal_newlines=universal_newlines,
-                       env=env)
-  if print_output:
-    output_array = []
-    while True:
-      line = p.stdout.readline()
-      if not line:
-        break
-      print line.strip("\n")
-      output_array.append(line)
-    output = "".join(output_array)
-  else:
-    output = p.stdout.read()
-  p.wait()
-  errout = p.stderr.read()
-  if print_output and errout:
-    print >>sys.stderr, errout
-  p.stdout.close()
-  p.stderr.close()
-  return output, p.returncode
+    Returns:
+        Tuple (output, return code)
+    """
+    logging.info("Running %s", command)
+    p = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=use_shell,
+        universal_newlines=universal_newlines,
+        env=env
+    )
 
+    if print_output:
+        output_lines = []
+        for line in iter(p.stdout.readline, ''):
+            print(line.strip())
+            output_lines.append(line)
+        output = "".join(output_lines)
+    else:
+        output = p.stdout.read()
 
-def RunShell(command, silent_ok=False, universal_newlines=True,
-             print_output=False, env=os.environ):
-  data, retcode = RunShellWithReturnCode(command, print_output,
-                                         universal_newlines, env)
-  if retcode:
-    ErrorExit("Got error status from %s:\n%s" % (command, data))
-  if not silent_ok and not data:
-    ErrorExit("No output from %s" % command)
-  return data
+    p.wait()
+    errout = p.stderr.read()
 
+    if print_output and errout:
+        print(errout, file=sys.stderr)
+
+    p.stdout.close()
+    p.stderr.close()
+
+    return output, p.returncode
+
+def run_shell(command, silent_ok=False, universal_newlines=True,
+              print_output=False, env=os.environ):
+    data, retcode = run_shell_with_return_code(command, print_output,
+                                               universal_newlines, env)
+    if retcode:
+        error_exit(f"Got error status from {command}:\n{data}")
+    if not silent_ok and not data:
+        error_exit(f"No output from {command}")
+    return data
 
 class VersionControlSystem(object):
-  """Abstract base class providing an interface to the VCS."""
+    """Abstract base class providing an interface to the VCS."""
 
-  def __init__(self, options):
-    """Constructor.
+    def __init__(self, options):
+        """Constructor.
 
-    Args:
-      options: Command line options.
-    """
-    self.options = options
+        Args:
+            options: Command line options.
+        """
+        self.options = options
 
-  def GenerateDiff(self, args):
-    """Return the current diff as a string.
+    def generate_diff(self, args):
+        """Return the current diff as a string.
 
-    Args:
-      args: Extra arguments to pass to the diff command.
-    """
-    raise NotImplementedError(
-        "abstract method -- subclass %s must override" % self.__class__)
+        Args:
+            args: Extra arguments to pass to the diff command.
+        """
+        raise NotImplementedError(
+            f"abstract method -- subclass {self.__class__.__name__} must override"
+        )
 
-  def GetUnknownFiles(self):
-    """Return a list of files unknown to the VCS."""
-    raise NotImplementedError(
-        "abstract method -- subclass %s must override" % self.__class__)
+    def get_unknown_files(self):
+        """Return a list of files unknown to the VCS."""
+        raise NotImplementedError(
+            f"abstract method -- subclass {self.__class__.__name__} must override"
+        )
 
-  def CheckForUnknownFiles(self):
-    """Show an "are you sure?" prompt if there are unknown files."""
-    unknown_files = self.GetUnknownFiles()
-    if unknown_files:
-      print "The following files are not added to version control:"
-      for line in unknown_files:
-        print line
-      prompt = "Are you sure to continue?(y/N) "
-      answer = raw_input(prompt).strip()
-      if answer != "y":
-        ErrorExit("User aborted")
+    def check_for_unknown_files(self):
+        """Show an "are you sure?" prompt if there are unknown files."""
+        unknown_files = self.get_unknown_files()
+        if unknown_files:
+            print("The following files are not added to version control:")
+            for line in unknown_files:
+                print(line)
+            prompt = "Are you sure to continue? (y/N) "
+            answer = input(prompt).strip().lower()
+            if answer != "y":
+                error_exit("User aborted")
 
-  def GetBaseFile(self, filename):
-    """Get the content of the upstream version of a file.
+    def get_base_file(self, filename):
+        """Get the content of the upstream version of a file.
 
-    Returns:
-      A tuple (base_content, new_content, is_binary, status)
-        base_content: The contents of the base file.
-        new_content: For text files, this is empty.  For binary files, this is
-          the contents of the new file, since the diff output won't contain
-          information to reconstruct the current file.
-        is_binary: True iff the file is binary.
-        status: The status of the file.
-    """
+        Returns:
+            A tuple (base_content, new_content, is_binary, status)
+              base_content: The contents of the base file.
+              new_content: For text files, this is empty. For binary files, this is
+                the contents of the new file, since the diff output won't contain
+                information to reconstruct the current file.
+              is_binary: True if the file is binary.
+              status: The status of the file.
+        """
+        raise NotImplementedError(
+            f"abstract method -- subclass {self.__class__.__name__} must override"
+        )
 
-    raise NotImplementedError(
-        "abstract method -- subclass %s must override" % self.__class__)
+    def get_base_files(self, diff):
+        """Helper that calls get_base_file for each file in the patch.
 
+        Returns:
+            A dictionary that maps from filename to get_base_file's tuple.
+        """
+        files = {}
+        for line in diff.splitlines(True):
+            if line.startswith('Index:') or line.startswith('Property changes on:'):
+                _, filename = line.split(':', 1)
+                filename = filename.strip().replace('\\', '/')
+                files[filename] = self.get_base_file(filename)
+        return files
 
-  def GetBaseFiles(self, diff):
-    """Helper that calls GetBase file for each file in the patch.
+    def upload_base_files(self, issue, rpc_server, patch_list, patchset, options, files):
+        """Uploads the base files (and if necessary, the current ones as well)."""
 
-    Returns:
-      A dictionary that maps from filename to GetBaseFile's tuple.  Filenames
-      are retrieved based on lines that start with "Index:" or
-      "Property changes on:".
-    """
-    files = {}
-    for line in diff.splitlines(True):
-      if line.startswith('Index:') or line.startswith('Property changes on:'):
-        unused, filename = line.split(':', 1)
-        # On Windows if a file has property changes its filename uses '\'
-        # instead of '/'.
-        filename = filename.strip().replace('\\', '/')
-        files[filename] = self.GetBaseFile(filename)
-    return files
+        def upload_file(filename, file_id, content, is_binary, status, is_base):
+            """Uploads a file to the server."""
+            file_too_large = False
+            file_type = "base" if is_base else "current"
+            if len(content) > MAX_UPLOAD_SIZE:
+                print(f"Not uploading the {file_type} file for {filename} because it's too large.")
+                file_too_large = True
+                content = ""
+            checksum = md5(content.encode()).hexdigest()
+            if options.verbose > 0 and not file_too_large:
+                print(f"Uploading {file_type} file for {filename}")
+            url = f"/{int(issue)}/upload_content/{int(patchset)}/{file_id}"
+            form_fields = [
+                ("filename", filename),
+                ("status", status),
+                ("checksum", checksum),
+                ("is_binary", str(is_binary)),
+                ("is_current", str(not is_base)),
+            ]
+            if file_too_large:
+                form_fields.append(("file_too_large", "1"))
+            if options.email:
+                form_fields.append(("user", options.email))
+            ctype, body = encode_multipart_form_data(form_fields, [("data", filename, content)])
+            response_body = rpc_server.send(url, body, content_type=ctype)
+            if not response_body.startswith("OK"):
+                status_update(f"  --> {response_body}")
+                sys.exit(1)
 
+        patches = {v: k for k, v in patch_list}
+        for filename, file_id_str in patches.items():
+            base_content, new_content, is_binary, status = files[filename]
+            if "nobase" in file_id_str:
+                base_content = None
+                file_id_str = file_id_str[file_id_str.rfind("_") + 1:]
+            file_id = int(file_id_str)
+            if base_content is not None:
+                upload_file(filename, file_id, base_content, is_binary, status, True)
+            if new_content is not None:
+                upload_file(filename, file_id, new_content, is_binary, status, False)
 
-  def UploadBaseFiles(self, issue, rpc_server, patch_list, patchset, options,
-                      files):
-    """Uploads the base files (and if necessary, the current ones as well)."""
+    def is_image(self, filename):
+        """Returns true if the filename has an image extension."""
+        mimetype = mimetypes.guess_type(filename)[0]
+        return mimetype is not None and mimetype.startswith("image/")
 
-    def UploadFile(filename, file_id, content, is_binary, status, is_base):
-      """Uploads a file to the server."""
-      file_too_large = False
-      if is_base:
-        type = "base"
-      else:
-        type = "current"
-      if len(content) > MAX_UPLOAD_SIZE:
-        print ("Not uploading the %s file for %s because it's too large." %
-               (type, filename))
-        file_too_large = True
-        content = ""
-      checksum = md5(content).hexdigest()
-      if options.verbose > 0 and not file_too_large:
-        print "Uploading %s file for %s" % (type, filename)
-      url = "/%d/upload_content/%d/%d" % (int(issue), int(patchset), file_id)
-      form_fields = [("filename", filename),
-                     ("status", status),
-                     ("checksum", checksum),
-                     ("is_binary", str(is_binary)),
-                     ("is_current", str(not is_base)),
-                    ]
-      if file_too_large:
-        form_fields.append(("file_too_large", "1"))
-      if options.email:
-        form_fields.append(("user", options.email))
-      ctype, body = EncodeMultipartFormData(form_fields,
-                                            [("data", filename, content)])
-      response_body = rpc_server.Send(url, body,
-                                      content_type=ctype)
-      if not response_body.startswith("OK"):
-        StatusUpdate("  --> %s" % response_body)
-        sys.exit(1)
-
-    patches = dict()
-    [patches.setdefault(v, k) for k, v in patch_list]
-    for filename in patches.keys():
-      base_content, new_content, is_binary, status = files[filename]
-      file_id_str = patches.get(filename)
-      if file_id_str.find("nobase") != -1:
-        base_content = None
-        file_id_str = file_id_str[file_id_str.rfind("_") + 1:]
-      file_id = int(file_id_str)
-      if base_content != None:
-        UploadFile(filename, file_id, base_content, is_binary, status, True)
-      if new_content != None:
-        UploadFile(filename, file_id, new_content, is_binary, status, False)
-
-  def IsImage(self, filename):
-    """Returns true if the filename has an image extension."""
-    mimetype =  mimetypes.guess_type(filename)[0]
-    if not mimetype:
-      return False
-    return mimetype.startswith("image/")
-
-  def IsBinary(self, filename):
-    """Returns true if the guessed mimetyped isnt't in text group."""
-    mimetype = mimetypes.guess_type(filename)[0]
-    if not mimetype:
-      return False  # e.g. README, "real" binaries usually have an extension
-    # special case for text files which don't start with text/
-    if mimetype in TEXT_MIMETYPES:
-      return False
-    return not mimetype.startswith("text/")
+    def is_binary(self, filename):
+        """Returns true if the guessed mimetype isn't in the text group."""
+        mimetype = mimetypes.guess_type(filename)[0]
+        if not mimetype:
+            return False
+        if mimetype in TEXT_MIMETYPES:
+            return False
+        return not mimetype.startswith("text/")
 
 
 class SubversionVCS(VersionControlSystem):
@@ -805,7 +799,7 @@ class SubversionVCS(VersionControlSystem):
       required: If true, exits if the url can't be guessed, otherwise None is
         returned.
     """
-    info = RunShell(["svn", "info"])
+    info = run_shell(["svn", "info"])
     for line in info.splitlines():
       words = line.split()
       if len(words) == 2 and words[0] == "URL:":
@@ -847,7 +841,7 @@ class SubversionVCS(VersionControlSystem):
     if self.options.revision:
       cmd += ["-r", self.options.revision]
     cmd.extend(args)
-    data = RunShell(cmd)
+    data = run_shell(cmd)
     count = 0
     for line in data.splitlines():
       if line.startswith("Index:") or line.startswith("Property changes on:"):
@@ -889,7 +883,7 @@ class SubversionVCS(VersionControlSystem):
     return re.sub(r"\$(%s):(:?)([^\$]+)\$" % '|'.join(keywords), repl, content)
 
   def GetUnknownFiles(self):
-    status = RunShell(["svn", "status", "--ignore-externals"], silent_ok=True)
+    status = run_shell(["svn", "status", "--ignore-externals"], silent_ok=True)
     unknown_files = []
     for line in status.split("\n"):
       if line and line[0] == "?":
@@ -909,7 +903,7 @@ class SubversionVCS(VersionControlSystem):
   def GetStatus(self, filename):
     """Returns the status of a file."""
     if not self.options.revision:
-      status = RunShell(["svn", "status", "--ignore-externals", filename])
+      status = run_shell(["svn", "status", "--ignore-externals", filename])
       if not status:
         ErrorExit("svn status returned no output for %s" % filename)
       status_lines = status.splitlines()
@@ -929,7 +923,7 @@ class SubversionVCS(VersionControlSystem):
       dirname, relfilename = os.path.split(filename)
       if dirname not in self.svnls_cache:
         cmd = ["svn", "list", "-r", self.rev_start, dirname or "."]
-        out, returncode = RunShellWithReturnCode(cmd)
+        out, returncode = run_shell_with_return_code(cmd)
         if returncode:
           ErrorExit("Failed to get status for %s." % filename)
         old_files = out.splitlines()
@@ -937,7 +931,7 @@ class SubversionVCS(VersionControlSystem):
         if self.rev_end:
           args += ["-r", self.rev_end]
         cmd = args + [dirname or "."]
-        out, returncode = RunShellWithReturnCode(cmd)
+        out, returncode = run_shell_with_return_code(cmd)
         if returncode:
           ErrorExit("Failed to run command %s" % cmd)
         self.svnls_cache[dirname] = (old_files, out.splitlines())
@@ -962,7 +956,7 @@ class SubversionVCS(VersionControlSystem):
     if status[0] == "A" and status[3] != "+":
       # We'll need to upload the new content if we're adding a binary file
       # since diff's output won't contain it.
-      mimetype = RunShell(["svn", "propget", "svn:mime-type", filename],
+      mimetype = run_shell(["svn", "propget", "svn:mime-type", filename],
                           silent_ok=True)
       base_content = ""
       is_binary = bool(mimetype) and not mimetype.startswith("text/")
@@ -979,7 +973,7 @@ class SubversionVCS(VersionControlSystem):
         url = filename
         args += ["-r", "BASE"]
       cmd = ["svn"] + args + ["propget", "svn:mime-type", url]
-      mimetype, returncode = RunShellWithReturnCode(cmd)
+      mimetype, returncode = run_shell_with_return_code(cmd)
       if returncode:
         # File does not exist in the requested revision.
         # Reset mimetype, it contains an error message.
@@ -997,7 +991,7 @@ class SubversionVCS(VersionControlSystem):
               new_content = self.ReadFile(filename)
             else:
               url = "%s/%s@%s" % (self.svn_base, filename, self.rev_end)
-              new_content = RunShell(["svn", "cat", url],
+              new_content = run_shell(["svn", "cat", url],
                                      universal_newlines=True, silent_ok=True)
         else:
           base_content = ""
@@ -1013,11 +1007,11 @@ class SubversionVCS(VersionControlSystem):
           # "svn cat -r REV delete_file.txt" doesn't work. cat requires
           # the full URL with "@REV" appended instead of using "-r" option.
           url = "%s/%s@%s" % (self.svn_base, filename, self.rev_start)
-          base_content = RunShell(["svn", "cat", url],
+          base_content = run_shell(["svn", "cat", url],
                                   universal_newlines=universal_newlines,
                                   silent_ok=True)
         else:
-          base_content = RunShell(["svn", "cat", filename],
+          base_content = run_shell(["svn", "cat", filename],
                                   universal_newlines=universal_newlines,
                                   silent_ok=True)
         if not is_binary:
@@ -1028,11 +1022,11 @@ class SubversionVCS(VersionControlSystem):
             url = filename
             args += ["-r", "BASE"]
           cmd = ["svn"] + args + ["propget", "svn:keywords", url]
-          keywords, returncode = RunShellWithReturnCode(cmd)
+          keywords, returncode = run_shell_with_return_code(cmd)
           if keywords and not returncode:
             base_content = self._CollapseKeywords(base_content, keywords)
     else:
-      StatusUpdate("svn status returned unexpected output: %s" % status)
+      status_update("svn status returned unexpected output: %s" % status)
       sys.exit(1)
     return base_content, new_content, is_binary, status[0:5]
 
@@ -1065,7 +1059,7 @@ class GitVCS(VersionControlSystem):
     # git config key "diff.external" is used).
     env = os.environ.copy()
     if 'GIT_EXTERNAL_DIFF' in env: del env['GIT_EXTERNAL_DIFF']
-    gitdiff = RunShell(["git", "diff", "--no-ext-diff", "--full-index", "-M"]
+    gitdiff = run_shell(["git", "diff", "--no-ext-diff", "--full-index", "-M"]
                        + extra_args, env=env)
 
     def IsFileNew(filename):
@@ -1120,13 +1114,13 @@ class GitVCS(VersionControlSystem):
     return "".join(svndiff)
 
   def GetUnknownFiles(self):
-    status = RunShell(["git", "ls-files", "--exclude-standard", "--others"],
+    status = run_shell(["git", "ls-files", "--exclude-standard", "--others"],
                       silent_ok=True)
     return status.splitlines()
 
   def GetFileContent(self, file_hash, is_binary):
     """Returns the content of a file identified by its git hash."""
-    data, retcode = RunShellWithReturnCode(["git", "show", file_hash],
+    data, retcode = run_shell_with_return_code(["git", "show", file_hash],
                                             universal_newlines=not is_binary)
     if retcode:
       ErrorExit("Got error status from 'git show %s'" % file_hash)
@@ -1143,7 +1137,7 @@ class GitVCS(VersionControlSystem):
       status = "A +"  # Match svn attribute name for renames.
       if filename not in self.hashes:
         # If a rename doesn't change the content, we never get a hash.
-        base_content = RunShell(["git", "show", "HEAD:" + filename])
+        base_content = run_shell(["git", "show", "HEAD:" + filename])
     elif not hash_before:
       status = "A"
       base_content = ""
@@ -1182,7 +1176,7 @@ class MercurialVCS(VersionControlSystem):
     if self.options.revision:
       self.base_rev = self.options.revision
     else:
-      self.base_rev = RunShell(["hg", "parent", "-q"]).split(':')[1].strip()
+      self.base_rev = run_shell(["hg", "parent", "-q"]).split(':')[1].strip()
 
   def _GetRelPath(self, filename):
     """Get relative path of a file according to the current directory,
@@ -1194,7 +1188,7 @@ class MercurialVCS(VersionControlSystem):
     # If no file specified, restrict to the current subdir
     extra_args = extra_args or ["."]
     cmd = ["hg", "diff", "--git", "-r", self.base_rev] + extra_args
-    data = RunShell(cmd, silent_ok=True)
+    data = run_shell(cmd, silent_ok=True)
     svndiff = []
     filecount = 0
     for line in data.splitlines():
@@ -1219,7 +1213,7 @@ class MercurialVCS(VersionControlSystem):
   def GetUnknownFiles(self):
     """Return a list of files unknown to the VCS."""
     args = []
-    status = RunShell(["hg", "status", "--rev", self.base_rev, "-u", "."],
+    status = run_shell(["hg", "status", "--rev", self.base_rev, "-u", "."],
         silent_ok=True)
     unknown_files = []
     for line in status.splitlines():
@@ -1237,7 +1231,7 @@ class MercurialVCS(VersionControlSystem):
     is_binary = False
     oldrelpath = relpath = self._GetRelPath(filename)
     # "hg status -C" returns two lines for moved/copied files, one otherwise
-    out = RunShell(["hg", "status", "-C", "--rev", self.base_rev, relpath])
+    out = run_shell(["hg", "status", "-C", "--rev", self.base_rev, relpath])
     out = out.splitlines()
     # HACK: strip error message about missing file/directory if it isn't in
     # the working copy
@@ -1255,7 +1249,7 @@ class MercurialVCS(VersionControlSystem):
     else:
       base_rev = self.base_rev
     if status != "A":
-      base_content = RunShell(["hg", "cat", "-r", base_rev, oldrelpath],
+      base_content = run_shell(["hg", "cat", "-r", base_rev, oldrelpath],
         silent_ok=True)
       is_binary = "\0" in base_content  # Mercurial's heuristic
     if status != "R":
@@ -1263,7 +1257,7 @@ class MercurialVCS(VersionControlSystem):
       is_binary = is_binary or "\0" in new_content
     if is_binary and base_content:
       # Fetch again without converting newlines
-      base_content = RunShell(["hg", "cat", "-r", base_rev, oldrelpath],
+      base_content = run_shell(["hg", "cat", "-r", base_rev, oldrelpath],
         silent_ok=True, universal_newlines=False)
     if not is_binary or not self.IsImage(relpath):
       new_content = None
@@ -1327,13 +1321,13 @@ def UploadSeparatePatches(issue, rpc_server, patchset, data, options):
     if not options.download_base:
       form_fields.append(("content_upload", "1"))
     files = [("data", "data.diff", patch[1])]
-    ctype, body = EncodeMultipartFormData(form_fields, files)
+    ctype, body = encode_multipart_form_data(form_fields, files)
     url = "/%d/upload_patch/%d" % (int(issue), int(patchset))
     print "Uploading patch for " + patch[0]
     response_body = rpc_server.Send(url, body, content_type=ctype)
     lines = response_body.splitlines()
     if not lines or lines[0] != "OK":
-      StatusUpdate("  --> %s" % response_body)
+      status_update("  --> %s" % response_body)
       sys.exit(1)
     rv.append([lines[1], patch[0]])
   return rv
@@ -1355,7 +1349,7 @@ def GuessVCSName():
   # Try running it, but don't die if we don't have hg installed.
   # NOTE: we try Mercurial first as it can sit on top of an SVN working copy.
   try:
-    out, returncode = RunShellWithReturnCode(["hg", "root"])
+    out, returncode = run_shell_with_return_code(["hg", "root"])
     if returncode == 0:
       return (VCS_MERCURIAL, out.strip())
   except OSError, (errno, message):
@@ -1370,7 +1364,7 @@ def GuessVCSName():
   # Git has a command to test if you're in a git tree.
   # Try running it, but don't die if we don't have git installed.
   try:
-    out, returncode = RunShellWithReturnCode(["git", "rev-parse",
+    out, returncode = run_shell_with_return_code(["git", "rev-parse",
                                               "--is-inside-work-tree"])
     if returncode == 0:
       return (VCS_GIT, None)
@@ -1406,7 +1400,7 @@ def GuessVCS(options):
 
   if vcs == VCS_MERCURIAL:
     if extra_output is None:
-      extra_output = RunShell(["hg", "root"]).strip()
+      extra_output = run_shell(["hg", "root"]).strip()
     return MercurialVCS(options, extra_output)
   elif vcs == VCS_SUBVERSION:
     return SubversionVCS(options)
@@ -1597,7 +1591,7 @@ def RealMain(argv, data=None):
   message = options.message or raw_input(prompt).strip()
   if not message:
     ErrorExit("A non-empty message is required")
-  rpc_server = GetRpcServer(options)
+  rpc_server = get_rpc_server(options)
   form_fields = [("subject", message)]
   if base:
     form_fields.append(("base", base))
@@ -1649,7 +1643,7 @@ def RealMain(argv, data=None):
     form_fields.append(("separate_patches", "1"))
   else:
     uploaded_diff_file = [("data", "data.diff", data)]
-  ctype, body = EncodeMultipartFormData(form_fields, uploaded_diff_file)
+  ctype, body = encode_multipart_form_data(form_fields, uploaded_diff_file)
   response_body = rpc_server.Send("/upload", body, content_type=ctype)
   patchset = None
   if not options.download_base or not uploaded_diff_file:
@@ -1662,7 +1656,7 @@ def RealMain(argv, data=None):
       msg = response_body
   else:
     msg = response_body
-  StatusUpdate(msg)
+  status_update(msg)
   if not response_body.startswith("Issue created.") and \
   not response_body.startswith("Issue updated."):
     sys.exit(0)
@@ -1685,7 +1679,7 @@ def main():
     RealMain(sys.argv)
   except KeyboardInterrupt:
     print
-    StatusUpdate("Interrupted.")
+    status_update("Interrupted.")
     sys.exit(1)
 
 
